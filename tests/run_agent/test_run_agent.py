@@ -3514,6 +3514,31 @@ class TestNativeMultimodalInput:
             ],
         }]
 
+    def test_preflight_codex_api_kwargs_preserves_multimodal_user_content(self, agent):
+        api_kwargs = {
+            "model": agent.model or "gpt-5.4",
+            "instructions": "You are Hermes.",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Can you inspect this?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+            }],
+            "tools": [],
+            "store": False,
+        }
+
+        normalized = agent._preflight_codex_api_kwargs(api_kwargs)
+
+        assert normalized["input"] == [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Can you inspect this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }]
+
     def test_prepare_anthropic_messages_preserves_native_image_blocks_when_supported(self, agent):
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"

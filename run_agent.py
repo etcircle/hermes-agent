@@ -3195,6 +3195,55 @@ class AIAgent:
 
         return items
 
+    def _normalize_codex_message_content(self, content: Any, *, item_idx: int) -> Any:
+        """Normalize Responses API message content while preserving multimodal blocks."""
+        converted = convert_chat_content_to_responses(content)
+        if converted is None:
+            return ""
+        if isinstance(converted, str):
+            return converted
+        if not isinstance(converted, list):
+            return str(converted)
+
+        normalized_parts: List[Dict[str, Any]] = []
+        for part_idx, part in enumerate(converted):
+            if not isinstance(part, dict):
+                raise ValueError(
+                    f"Codex Responses input[{item_idx}].content[{part_idx}] must be an object."
+                )
+
+            part_type = str(part.get("type", "") or "").strip()
+            if part_type == "input_text":
+                text = part.get("text", "")
+                if text is None:
+                    text = ""
+                if not isinstance(text, str):
+                    text = str(text)
+                normalized_parts.append({"type": "input_text", "text": text})
+                continue
+
+            if part_type == "input_image":
+                image_url = part.get("image_url", "")
+                detail = part.get("detail")
+                if isinstance(image_url, dict):
+                    detail = image_url.get("detail", detail)
+                    image_url = image_url.get("url", "")
+                if image_url is None:
+                    image_url = ""
+                if not isinstance(image_url, str):
+                    image_url = str(image_url)
+                entry: Dict[str, Any] = {"type": "input_image", "image_url": image_url}
+                if isinstance(detail, str) and detail.strip():
+                    entry["detail"] = detail.strip()
+                normalized_parts.append(entry)
+                continue
+
+            raise ValueError(
+                f"Codex Responses input[{item_idx}].content[{part_idx}] has unsupported part type {part_type!r}."
+            )
+
+        return normalized_parts
+
     def _preflight_codex_input_items(self, raw_items: Any) -> List[Dict[str, Any]]:
         if not isinstance(raw_items, list):
             raise ValueError("Codex Responses input must be a list of input items.")
@@ -3266,13 +3315,15 @@ class AIAgent:
 
             role = item.get("role")
             if role in {"user", "assistant"}:
-                content = item.get("content", "")
-                if content is None:
-                    content = ""
-                if not isinstance(content, str):
-                    content = str(content)
-
-                normalized.append({"role": role, "content": content})
+                normalized.append(
+                    {
+                        "role": role,
+                        "content": self._normalize_codex_message_content(
+                            item.get("content", ""),
+                            item_idx=idx,
+                        ),
+                    }
+                )
                 continue
 
             raise ValueError(
