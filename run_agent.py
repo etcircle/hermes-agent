@@ -106,6 +106,11 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.multimodal import (
+    convert_chat_content_to_responses,
+    describe_user_payload_for_log,
+    resolve_native_vision_support,
+)
 from utils import atomic_json_write, env_var_enabled
 
 
@@ -3102,7 +3107,8 @@ class AIAgent:
 
             if role in {"user", "assistant"}:
                 content = msg.get("content", "")
-                content_text = str(content) if content is not None else ""
+                converted_content = convert_chat_content_to_responses(content)
+                content_text = converted_content if isinstance(converted_content, str) else None
 
                 if role == "assistant":
                     # Replay encrypted reasoning items from previous turns
@@ -3115,8 +3121,10 @@ class AIAgent:
                                 items.append(ri)
                                 has_codex_reasoning = True
 
-                    if content_text.strip():
+                    if isinstance(content_text, str) and content_text.strip():
                         items.append({"role": "assistant", "content": content_text})
+                    elif converted_content not in (None, "", []):
+                        items.append({"role": "assistant", "content": converted_content})
                     elif has_codex_reasoning:
                         # The Responses API requires a following item after each
                         # reasoning item (otherwise: missing_following_item error).
@@ -3168,7 +3176,7 @@ class AIAgent:
                             })
                     continue
 
-                items.append({"role": role, "content": content_text})
+                items.append({"role": role, "content": converted_content})
                 continue
 
             if role == "tool":
@@ -5356,6 +5364,15 @@ class AIAgent:
         ):
             return api_messages
 
+        native_supported, _ = resolve_native_vision_support(
+            provider=self.provider,
+            model=self.model,
+            api_mode=self.api_mode,
+            base_url=self.base_url,
+        )
+        if native_supported is True:
+            return api_messages
+
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -7080,7 +7097,8 @@ class AIAgent:
         Run a complete conversation with tool calling until completion.
 
         Args:
-            user_message (str): The user's message/question
+            user_message: The user's message/question, or multimodal content blocks
+                for providers that support native image input.
             system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
             conversation_history (List[Dict]): Previous conversation messages (optional)
             task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
@@ -7150,8 +7168,7 @@ class AIAgent:
         self.iteration_budget = IterationBudget(self.max_iterations)
 
         # Log conversation turn start for debugging/observability
-        _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
-        _msg_preview = _msg_preview.replace("\n", " ")
+        _msg_preview = describe_user_payload_for_log(user_message, limit=80)
         logger.info(
             "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
             self.session_id or "none", self.model, self.provider or "unknown",
@@ -7206,7 +7223,8 @@ class AIAgent:
         self._persist_user_message_idx = current_turn_user_idx
         
         if not self.quiet_mode:
-            self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
+            _display_preview = describe_user_payload_for_log(user_message, limit=60)
+            self._safe_print(f"💬 Starting conversation: '{_display_preview}'")
         
         # ── System prompt (cached per session for prefix caching) ──
         # Built once on first call, reused for all subsequent calls.

@@ -3467,6 +3467,70 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_persist_session_rewrites_multimodal_current_turn_user_message(self, agent):
+        agent._session_db = MagicMock()
+        agent.session_id = "session-123"
+        agent._last_flushed_db_idx = 0
+        agent._persist_user_message_idx = 0
+        agent._persist_user_message_override = "[User attached 1 image]"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            },
+            {"role": "assistant", "content": "Hi!"},
+        ]
+
+        with patch.object(agent, "_save_session_log") as mock_save:
+            agent._persist_session(messages, [])
+
+        assert messages[0]["content"] == "[User attached 1 image]"
+        saved_messages = mock_save.call_args.args[0]
+        assert saved_messages[0]["content"] == "[User attached 1 image]"
+        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
+        assert first_db_write["content"] == "[User attached 1 image]"
+
+
+class TestNativeMultimodalInput:
+    def test_chat_messages_to_responses_input_preserves_user_image_blocks_for_codex(self, agent):
+        api_messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Can you inspect this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }]
+
+        items = agent._chat_messages_to_responses_input(api_messages)
+
+        assert items == [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Can you inspect this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }]
+
+    def test_prepare_anthropic_messages_preserves_native_image_blocks_when_supported(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        agent.model = "claude-sonnet-4-20250514"
+        api_messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Can you inspect this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ],
+        }]
+
+        with patch("run_agent.resolve_native_vision_support", return_value=(True, "supports vision")):
+            transformed = agent._prepare_anthropic_messages_for_api(api_messages)
+
+        assert transformed == api_messages
+
 
 # ---------------------------------------------------------------------------
 # Bugfix: _vprint force=True on error messages during TTS

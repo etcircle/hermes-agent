@@ -236,6 +236,12 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from agent.multimodal import (
+    build_multimodal_user_content,
+    build_persist_user_message,
+    prepend_text_to_user_content,
+    resolve_native_vision_support,
+)
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -2727,16 +2733,17 @@ class GatewayRunner:
                     context_prompt += f"\n\n{vc_context}"
 
         # -----------------------------------------------------------------
-        # Auto-analyze images sent by the user
+        # Collect user-attached images.
         #
-        # If the user attached image(s), we run the vision tool eagerly so
-        # the conversation model always receives a text description.  The
-        # local file path is also included so the model can re-examine the
-        # image later with a more targeted question via vision_analyze.
+        # Gateway image handling is resolved later inside _run_agent(), after
+        # smart model routing chooses the actual runtime for this turn. That
+        # later step decides whether to:
+        #   - use auxiliary describe-first fallback, or
+        #   - send native multimodal image blocks to the main model.
         #
         # We filter to image paths only (by media_type) so that non-image
-        # attachments (documents, audio, etc.) are not sent to the vision
-        # tool even when they appear in the same message.
+        # attachments (documents, audio, etc.) are excluded from the vision
+        # path even when they appear in the same message.
         # -----------------------------------------------------------------
         message_text = event.text or ""
 
@@ -2756,8 +2763,8 @@ class GatewayRunner:
         if _is_shared_thread and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
+        image_paths = []
         if event.media_urls:
-            image_paths = []
             for i, path in enumerate(event.media_urls):
                 # Check media_types if available; otherwise infer from message type
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
@@ -2767,10 +2774,6 @@ class GatewayRunner:
                 )
                 if is_image:
                     image_paths.append(path)
-            if image_paths:
-                message_text = await self._enrich_message_with_vision(
-                    message_text, image_paths
-                )
         
         # -----------------------------------------------------------------
         # Auto-transcribe voice/audio messages sent by the user
@@ -2925,6 +2928,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                image_paths=image_paths,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -5946,6 +5950,68 @@ class GatewayRunner:
             if var in os.environ:
                 del os.environ[var]
     
+    @staticmethod
+    def _resolve_gateway_vision_mode(user_config: dict) -> str:
+        """Return configured gateway image handling mode."""
+        raw = (
+            user_config.get("auxiliary", {})
+            .get("vision", {})
+            .get("gateway_mode", "describe")
+        )
+        mode = str(raw or "describe").strip().lower()
+        return mode if mode in {"describe", "auto", "passthrough"} else "describe"
+
+    async def _prepare_gateway_user_payload(
+        self,
+        user_text: str,
+        image_paths: List[str],
+        turn_route: dict,
+        user_config: dict,
+    ) -> tuple[Any, Optional[str], Optional[str]]:
+        """Build the current-turn user payload for gateway image inputs.
+
+        Returns:
+            (payload, persist_shadow, error_message)
+        """
+        if not image_paths:
+            return user_text, None, None
+
+        vision_mode = self._resolve_gateway_vision_mode(user_config)
+        if vision_mode == "describe":
+            enriched = await self._enrich_message_with_vision(user_text, image_paths)
+            return enriched, None, None
+
+        runtime = turn_route.get("runtime", {}) if isinstance(turn_route, dict) else {}
+        routed_model = (turn_route.get("model") if isinstance(turn_route, dict) else None) or ""
+        supported, reason = resolve_native_vision_support(
+            provider=runtime.get("provider", ""),
+            model=routed_model,
+            api_mode=runtime.get("api_mode", ""),
+            base_url=runtime.get("base_url", ""),
+        )
+
+        if supported is not True:
+            if vision_mode == "auto":
+                logger.info(
+                    "Gateway image auto-mode falling back to auxiliary describe path: %s",
+                    reason,
+                )
+                enriched = await self._enrich_message_with_vision(user_text, image_paths)
+                return enriched, None, None
+
+            model_label = routed_model or "current model"
+            provider_label = runtime.get("provider") or "current provider"
+            return None, None, (
+                "⚠️ Native image passthrough is forced, but the active runtime "
+                f"({provider_label} / {model_label}) is not known to support image input. "
+                f"Reason: {reason}. Either switch to a vision-capable model or set "
+                "`auxiliary.vision.gateway_mode` to `auto` or `describe`."
+            )
+
+        payload = build_multimodal_user_content(user_text, image_paths)
+        persist_shadow = build_persist_user_message(user_text, len(image_paths))
+        return payload, persist_shadow, None
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -6292,7 +6358,7 @@ class GatewayRunner:
 
     async def _run_agent(
         self,
-        message: str,
+        message: Any,
         context_prompt: str,
         history: List[Dict[str, Any]],
         source: SessionSource,
@@ -6300,6 +6366,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        image_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -6692,7 +6759,30 @@ class GatewayRunner:
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message if isinstance(message, str) else "",
+                model,
+                runtime_kwargs,
+            )
+
+            user_payload = message
+            persist_user_message = None
+            if image_paths:
+                user_payload, persist_user_message, payload_error = asyncio.run(
+                    self._prepare_gateway_user_payload(
+                        message if isinstance(message, str) else "",
+                        image_paths,
+                        turn_route,
+                        user_config,
+                    )
+                )
+                if payload_error:
+                    return {
+                        "final_response": payload_error,
+                        "messages": history,
+                        "api_calls": 0,
+                        "completed": True,
+                    }
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -6916,13 +7006,25 @@ class GatewayRunner:
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
             if _msn:
-                message = _msn + "\n\n" + message
+                user_payload = prepend_text_to_user_content(user_payload, _msn)
+                if persist_user_message is not None:
+                    persist_user_message = f"{_msn}\n\n{persist_user_message}" if persist_user_message else _msn
+                elif isinstance(user_payload, str):
+                    persist_user_message = user_payload
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
-                result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
+                if persist_user_message is None:
+                    result = agent.run_conversation(user_payload, conversation_history=agent_history, task_id=session_id)
+                else:
+                    result = agent.run_conversation(
+                        user_payload,
+                        conversation_history=agent_history,
+                        task_id=session_id,
+                        persist_user_message=persist_user_message,
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

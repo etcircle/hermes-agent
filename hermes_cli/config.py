@@ -364,6 +364,7 @@ DEFAULT_CONFIG = {
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
             "timeout": 30,         # seconds — LLM API call timeout; increase for slow local vision models
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+            "gateway_mode": "describe",  # describe | auto | passthrough (gateway image handling only)
         },
         "web_extract": {
             "provider": "auto",

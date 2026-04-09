@@ -262,8 +262,10 @@ class TestDefaultConfigShape:
         vision = DEFAULT_CONFIG["auxiliary"]["vision"]
         assert "provider" in vision
         assert "model" in vision
+        assert "gateway_mode" in vision
         assert vision["provider"] == "auto"
         assert vision["model"] == ""
+        assert vision["gateway_mode"] == "describe"
 
     def test_web_extract_task_structure(self):
         from hermes_cli.config import DEFAULT_CONFIG
