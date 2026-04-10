@@ -6290,6 +6290,66 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    @staticmethod
+    def _stall_timeout_should_fire(
+        *,
+        idle_secs: float,
+        timeout_secs: float,
+        nudge_sent_at: float | None,
+        now_monotonic: float,
+    ) -> bool:
+        """Return True when a stalled run should escalate to a hard timeout."""
+        if timeout_secs <= 0:
+            return False
+        if nudge_sent_at is None:
+            return idle_secs >= timeout_secs
+        return (now_monotonic - nudge_sent_at) >= timeout_secs
+
+    async def _maybe_auto_nudge_stalled_agent(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        agent: Any,
+        timeout_secs: float,
+        already_nudged: bool,
+        status_thread_metadata: Optional[dict],
+    ) -> bool:
+        """Interrupt a stalled run once with a synthetic 'continue' follow-up."""
+        if already_nudged or not session_key or agent is None:
+            return False
+
+        try:
+            from tools.approval import has_blocking_approval
+        except Exception:
+            has_blocking_approval = None
+
+        if has_blocking_approval and has_blocking_approval(session_key):
+            return False
+
+        nudge_text = "Please continue from where you left off."
+        timeout_mins = int(timeout_secs // 60) or 1
+        agent.interrupt(nudge_text)
+        logger.warning(
+            "Auto-nudging stalled agent for session %s after %.0fs of inactivity",
+            session_key,
+            timeout_secs,
+        )
+
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    f"⚠️ No activity for {timeout_mins} min — nudging the agent once to continue. "
+                    f"If it still stays stuck, Hermes will time it out on the next {timeout_mins}-minute window.",
+                    metadata=status_thread_metadata,
+                )
+            except Exception as exc:
+                logger.debug("Failed to send auto-nudge status message: %s", exc)
+
+        return True
+
     async def _run_agent(
         self,
         message: str,
@@ -6300,6 +6360,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        _stall_auto_nudge_count: int = 0,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -7155,6 +7216,7 @@ class GatewayRunner:
             _agent_warning_raw = float(os.getenv("HERMES_AGENT_TIMEOUT_WARNING", 900))
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
+            _stall_nudge_sent_at = None
             loop = asyncio.get_event_loop()
             _executor_task = asyncio.ensure_future(
                 loop.run_in_executor(None, run_sync)
@@ -7206,7 +7268,26 @@ class GatewayRunner:
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
-                    if _idle_secs >= _agent_timeout:
+                    _now_monotonic = loop.time()
+                    if self._stall_timeout_should_fire(
+                        idle_secs=_idle_secs,
+                        timeout_secs=_agent_timeout,
+                        nudge_sent_at=_stall_nudge_sent_at,
+                        now_monotonic=_now_monotonic,
+                    ):
+                        if _stall_nudge_sent_at is None and _stall_auto_nudge_count < 1:
+                            did_nudge = await self._maybe_auto_nudge_stalled_agent(
+                                session_key=session_key or "",
+                                source=source,
+                                agent=_agent_ref,
+                                timeout_secs=_agent_timeout,
+                                already_nudged=False,
+                                status_thread_metadata=_status_thread_metadata,
+                            )
+                            if did_nudge:
+                                _stall_nudge_sent_at = _now_monotonic
+                                _stall_auto_nudge_count += 1
+                                continue
                         _inactivity_timeout = True
                         break
 
@@ -7379,6 +7460,7 @@ class GatewayRunner:
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
+                    _stall_auto_nudge_count=_stall_auto_nudge_count,
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
