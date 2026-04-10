@@ -221,6 +221,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/v1/sessions", adapter._handle_list_sessions)
+    app.router.add_post("/v1/sessions", adapter._handle_create_session)
+    app.router.add_get("/v1/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -344,6 +347,156 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /v1/sessions endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestSessionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_list_sessions_returns_session_summaries(self, adapter):
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = [
+            {
+                "id": "session-1",
+                "source": "api_server",
+                "model": "hermes-agent",
+                "title": "Office session",
+                "started_at": 123.0,
+                "ended_at": None,
+                "message_count": 4,
+                "preview": "Draft a proposal",
+                "last_active": 456.0,
+                "parent_session_id": None,
+            }
+        ]
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/sessions?limit=10&offset=2&source=api_server")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["object"] == "list"
+            assert data["limit"] == 10
+            assert data["offset"] == 2
+            assert data["data"][0]["id"] == "session-1"
+            assert data["data"][0]["title"] == "Office session"
+
+        mock_db.list_sessions_rich.assert_called_once_with(
+            source="api_server",
+            limit=10,
+            offset=2,
+            include_children=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_session_uses_lineage_aware_title_resolution(self, adapter):
+        mock_db = MagicMock()
+        mock_db.resolve_session_id.return_value = None
+        mock_db.resolve_session_by_title.return_value = "session-latest"
+        mock_db.get_session.return_value = {
+            "id": "session-latest",
+            "source": "api_server",
+            "model": "hermes-agent",
+            "title": "Office session #3",
+            "started_at": 200.0,
+            "ended_at": None,
+            "message_count": 0,
+            "parent_session_id": None,
+        }
+        mock_db.get_messages.return_value = []
+        mock_db.get_messages_as_conversation.return_value = []
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/sessions/Office%20session")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["id"] == "session-latest"
+
+        mock_db.resolve_session_by_title.assert_called_once_with("Office session")
+
+    @pytest.mark.asyncio
+    async def test_get_session_returns_messages(self, adapter):
+        mock_db = MagicMock()
+        mock_db.resolve_session_id.return_value = "session-123"
+        mock_db.resolve_session_by_title.return_value = None
+        mock_db.get_session.return_value = {
+            "id": "session-123",
+            "source": "api_server",
+            "model": "hermes-agent",
+            "title": "Office session",
+            "started_at": 100.0,
+            "ended_at": None,
+            "message_count": 2,
+            "parent_session_id": None,
+        }
+        mock_db.get_messages.return_value = [
+            {"role": "user", "content": "Draft a proposal", "timestamp": 110.0},
+            {"role": "assistant", "content": "Sure", "timestamp": 120.0},
+        ]
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "Draft a proposal"},
+            {"role": "assistant", "content": "Sure"},
+        ]
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/sessions/session-123")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["id"] == "session-123"
+            assert data["preview"] == "Draft a proposal"
+            assert data["last_active"] == 120.0
+            assert data["messages"] == [
+                {"role": "user", "content": "Draft a proposal"},
+                {"role": "assistant", "content": "Sure"},
+            ]
+
+    @pytest.mark.asyncio
+    async def test_create_session_creates_real_session_row(self, adapter):
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {
+            "id": "created-session",
+            "source": "api_server",
+            "model": "hermes-agent",
+            "title": "Office session",
+            "started_at": 200.0,
+            "ended_at": None,
+            "message_count": 0,
+            "parent_session_id": None,
+        }
+        adapter._session_db = mock_db
+
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server.uuid.uuid4", return_value=uuid.UUID("12345678-1234-5678-1234-567812345678")):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/sessions",
+                    json={"title": "Office session", "source": "api_server", "model": "hermes-agent"},
+                )
+                assert resp.status == 201
+                data = await resp.json()
+                assert data["id"] == "created-session"
+
+        mock_db.create_session.assert_called_once_with(
+            session_id="12345678-1234-5678-1234-567812345678",
+            source="api_server",
+            model="hermes-agent",
+            model_config=None,
+            system_prompt=None,
+            user_id=None,
+            parent_session_id=None,
+        )
+        mock_db.set_session_title.assert_called_once_with(
+            "12345678-1234-5678-1234-567812345678",
+            "Office session",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1450,6 +1603,31 @@ class TestCORS:
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
 
     @pytest.mark.asyncio
+    async def test_cors_allows_hermes_session_id_header(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "X-Hermes-Session-Id",
+                },
+            )
+            assert resp.status == 200
+            assert "X-Hermes-Session-Id" in resp.headers.get("Access-Control-Allow-Headers", "")
+
+    @pytest.mark.asyncio
+    async def test_cors_exposes_hermes_session_id_header(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/health", headers={"Origin": "http://localhost:3000"})
+            assert resp.status == 200
+            assert "X-Hermes-Session-Id" in resp.headers.get("Access-Control-Expose-Headers", "")
+
+    @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         app = _create_app(adapter)
@@ -1696,8 +1874,8 @@ class TestSessionIdHeader:
             assert call_kwargs["user_message"] == "new question"
 
     @pytest.mark.asyncio
-    async def test_db_failure_falls_back_to_empty_history(self, adapter):
-        """If SessionDB raises, history falls back to empty and request still succeeds."""
+    async def test_db_failure_falls_back_to_request_history(self, adapter):
+        """If SessionDB raises, preserve request-body history and still succeed."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
         # Simulate DB failure: _session_db is None and SessionDB() constructor raises
         adapter._session_db = None
@@ -1710,10 +1888,20 @@ class TestSessionIdHeader:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     headers={"X-Hermes-Session-Id": "some-session"},
-                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": "Earlier client history"},
+                            {"role": "assistant", "content": "Earlier reply"},
+                            {"role": "user", "content": "Hi"},
+                        ],
+                    },
                 )
 
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["conversation_history"] == []
+            assert call_kwargs["conversation_history"] == [
+                {"role": "user", "content": "Earlier client history"},
+                {"role": "assistant", "content": "Earlier reply"},
+            ]
             assert call_kwargs["session_id"] == "some-session"

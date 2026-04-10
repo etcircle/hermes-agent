@@ -169,7 +169,8 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id",
+    "Access-Control-Expose-Headers": "X-Hermes-Session-Id",
 }
 
 
@@ -502,6 +503,161 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    def _get_session_db_or_error(self) -> tuple[Optional[Any], Optional["web.Response"]]:
+        """Return the shared SessionDB instance or a 503 error response."""
+        db = self._ensure_session_db()
+        if db is None:
+            return None, web.json_response(
+                _openai_error(
+                    "Hermes session database is unavailable",
+                    err_type="server_error",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        return db, None
+
+    @staticmethod
+    def _session_summary_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize SessionDB rows into a stable API payload."""
+        return {
+            "id": session.get("id"),
+            "object": "session",
+            "source": session.get("source"),
+            "model": session.get("model"),
+            "title": session.get("title"),
+            "started_at": session.get("started_at"),
+            "ended_at": session.get("ended_at"),
+            "message_count": session.get("message_count", 0),
+            "preview": session.get("preview", ""),
+            "last_active": session.get("last_active", session.get("started_at")),
+            "parent_session_id": session.get("parent_session_id"),
+        }
+
+    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions — list real Hermes sessions from SessionDB."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db, db_error = self._get_session_db_or_error()
+        if db_error:
+            return db_error
+
+        try:
+            limit = max(1, min(int(request.query.get("limit", "20")), 200))
+            offset = max(0, int(request.query.get("offset", "0")))
+        except ValueError:
+            return web.json_response(
+                _openai_error("limit and offset must be integers", code="invalid_pagination"),
+                status=400,
+            )
+
+        source = request.query.get("source") or None
+        include_children = request.query.get("include_children", "false").lower() in {"1", "true", "yes"}
+        sessions = db.list_sessions_rich(
+            source=source,
+            limit=limit,
+            offset=offset,
+            include_children=include_children,
+        )
+        return web.json_response(
+            {
+                "object": "list",
+                "data": [self._session_summary_payload(session) for session in sessions],
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+
+    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id} — fetch one Hermes session with messages."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db, db_error = self._get_session_db_or_error()
+        if db_error:
+            return db_error
+
+        session_lookup = request.match_info["session_id"]
+        resolved_session_id = db.resolve_session_id(session_lookup)
+        if resolved_session_id is None:
+            resolved_session_id = db.resolve_session_by_title(session_lookup) or session_lookup
+
+        session = db.get_session(resolved_session_id)
+        if session is None:
+            return web.json_response(
+                _openai_error(f"Session not found: {session_lookup}", code="session_not_found"),
+                status=404,
+            )
+
+        stored_messages = db.get_messages(resolved_session_id)
+        conversation_messages = db.get_messages_as_conversation(resolved_session_id)
+        if stored_messages:
+            session["last_active"] = stored_messages[-1].get("timestamp", session.get("started_at"))
+            first_user = next(
+                (message.get("content", "") for message in stored_messages if message.get("role") == "user" and message.get("content")),
+                "",
+            )
+            if first_user:
+                preview_text = first_user.replace("\n", " ").replace("\r", " ").strip()
+                session["preview"] = preview_text[:60] + ("..." if len(preview_text) > 60 else "")
+
+        payload = self._session_summary_payload(session)
+        payload["messages"] = conversation_messages
+        return web.json_response(payload)
+
+    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions — create a new real Hermes session in SessionDB."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db, db_error = self._get_session_db_or_error()
+        if db_error:
+            return db_error
+
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        session_id = str(uuid.uuid4())
+        source = str(body.get("source") or "api_server")
+        model = str(body.get("model") or self._model_name)
+        title = body.get("title")
+
+        try:
+            db.create_session(
+                session_id=session_id,
+                source=source,
+                model=model,
+                model_config=None,
+                system_prompt=None,
+                user_id=None,
+                parent_session_id=None,
+            )
+            if title:
+                db.set_session_title(session_id, str(title))
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_session_title"), status=400)
+        except Exception as exc:
+            logger.error("Failed to create API session %s: %s", session_id, exc, exc_info=True)
+            return web.json_response(
+                _openai_error("Failed to create Hermes session", err_type="server_error", code="session_create_failed"),
+                status=500,
+            )
+
+        session = db.get_session(session_id)
+        if session is None:
+            return web.json_response(
+                _openai_error("Created session could not be loaded", err_type="server_error", code="session_create_failed"),
+                status=500,
+            )
+
+        return web.json_response(self._session_summary_payload(session), status=201)
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -554,6 +710,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        # If SessionDB is temporarily unavailable, fall back to the request-body history
+        # rather than silently erasing continuity entirely.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
             session_id = provided_session_id
@@ -563,7 +721,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     history = db.get_messages_as_conversation(session_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             session_id = str(uuid.uuid4())
             # history already set from request body above
@@ -1633,6 +1790,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/v1/sessions", self._handle_list_sessions)
+            self._app.router.add_post("/v1/sessions", self._handle_create_session)
+            self._app.router.add_get("/v1/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
